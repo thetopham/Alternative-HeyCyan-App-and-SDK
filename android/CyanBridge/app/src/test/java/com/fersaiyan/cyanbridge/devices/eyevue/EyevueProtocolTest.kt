@@ -114,6 +114,30 @@ class EyevueProtocolTest {
     }
 
     @Test
+    fun photoAssemblerAcceptsCompatibleOverlapAcrossOffsets() {
+        val assembler = EyevuePhotoAssembler()
+        assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
+        assembler.append(photoDataPacket(offset = 0, bytes = byteArrayOf(0x01, 0x02, 0x03)))
+        assembler.append(photoDataPacket(offset = 2, bytes = byteArrayOf(0x03, 0x04)))
+
+        val image = assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END))
+
+        assertArrayEquals(byteArrayOf(0x01, 0x02, 0x03, 0x04), image)
+    }
+
+    @Test
+    fun photoAssemblerRejectsConflictingOverlapAcrossOffsets() {
+        val assembler = EyevuePhotoAssembler()
+        assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
+        assembler.append(photoDataPacket(offset = 0, bytes = byteArrayOf(0x01, 0x02, 0x03)))
+        assembler.append(photoDataPacket(offset = 2, bytes = byteArrayOf(0x09, 0x04)))
+
+        val image = assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END))
+
+        assertEquals(null, image)
+    }
+
+    @Test
     fun photoAssemblerRejectsConflictingDuplicateOffset() {
         val assembler = EyevuePhotoAssembler()
         assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
