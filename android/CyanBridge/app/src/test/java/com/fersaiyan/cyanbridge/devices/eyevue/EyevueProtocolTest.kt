@@ -117,12 +117,25 @@ class EyevueProtocolTest {
     fun photoAssemblerAcceptsCompatibleOverlapAcrossOffsets() {
         val assembler = EyevuePhotoAssembler()
         assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
-        assembler.append(photoDataPacket(offset = 0, bytes = byteArrayOf(0x01, 0x02, 0x03)))
-        assembler.append(photoDataPacket(offset = 2, bytes = byteArrayOf(0x03, 0x04)))
+        assembler.append(
+            photoDataPacket(
+                offset = 0,
+                bytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0x01),
+            ),
+        )
+        assembler.append(
+            photoDataPacket(
+                offset = 2,
+                bytes = byteArrayOf(0x01, 0xFF.toByte(), 0xD9.toByte()),
+            ),
+        )
 
         val image = assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END))
 
-        assertArrayEquals(byteArrayOf(0x01, 0x02, 0x03, 0x04), image)
+        assertArrayEquals(
+            byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0x01, 0xFF.toByte(), 0xD9.toByte()),
+            image,
+        )
     }
 
     @Test
@@ -148,6 +161,57 @@ class EyevueProtocolTest {
 
         assertEquals(null, image)
     }
+
+    @Test
+    fun photoAssemblerRejectsContiguousPrefixWithoutJpegEndMarker() {
+        val assembler = EyevuePhotoAssembler()
+        assembler.append(photoStartPacket(announcedMinimumBytes = 2))
+        assembler.append(
+            photoDataPacket(
+                offset = 0,
+                bytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte()),
+            ),
+        )
+
+        val image = assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END))
+
+        assertEquals(null, image)
+    }
+
+    @Test
+    fun photoAssemblerResetDropsInProgressTransfer() {
+        val assembler = EyevuePhotoAssembler()
+        assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
+        assembler.append(photoDataPacket(offset = 0, bytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte())))
+
+        assembler.reset()
+
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+
+        assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
+        assembler.append(
+            photoDataPacket(
+                offset = 0,
+                bytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()),
+            ),
+        )
+        assertArrayEquals(
+            byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()),
+            assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+        )
+    }
+
+    private fun photoStartPacket(announcedMinimumBytes: Int): ByteArray =
+        photoPacket(
+            EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START,
+            byteArrayOf(
+                0,
+                0,
+                ((announcedMinimumBytes ushr 8) and 0xFF).toByte(),
+                (announcedMinimumBytes and 0xFF).toByte(),
+                0,
+            ),
+        )
 
     private fun photoDataPacket(offset: Int, bytes: ByteArray): ByteArray =
         photoPacket(

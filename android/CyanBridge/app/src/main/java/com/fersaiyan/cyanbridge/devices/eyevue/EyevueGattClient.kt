@@ -319,8 +319,6 @@ class EyevueGattClient(
         pendingWrite?.complete(false)
         pendingWrite = null
         closeGatt()
-        decoder.reset()
-        photoAssembler.reset()
         _state.value = EyevueGattState.DISCONNECTED
     }
 
@@ -338,6 +336,9 @@ class EyevueGattClient(
             currentGatt?.close()
         } catch (_: Throwable) {
             // Permission loss during lifecycle cleanup should not escape.
+        } finally {
+            decoder.reset()
+            photoAssembler.reset()
         }
     }
 
