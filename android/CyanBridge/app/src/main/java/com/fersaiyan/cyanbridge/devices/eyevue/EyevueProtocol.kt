@@ -372,35 +372,52 @@ class EyevueFrameDecoder {
 
 /** Reassembles the AA15 photo stream used by the vendor's AI-photo path. */
 class EyevuePhotoAssembler {
-    private val buffer = ByteArrayOutputStream()
+    private companion object {
+        const val DATA_OFFSET_START = 5
+        const val IMAGE_BYTES_START = 9
+        const val MAX_TRANSFER_BYTES = 32 * 1024 * 1024
+    }
+
+    private val chunksByOffset = sortedMapOf<Int, ByteArray>()
     private var receiving = false
+    private var invalid = false
 
     fun append(packet: ByteArray): ByteArray? {
         if (packet.size < 8) return null
         val commandId = packet[4].toInt() and 0xFF
         val payloadEnd = packet.size - 3
-        if (payloadEnd < 5) return null
+        if (payloadEnd < DATA_OFFSET_START) return null
 
         return when (commandId) {
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START -> {
-                buffer.reset()
+                resetTransfer()
                 receiving = true
                 null
             }
 
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA -> {
-                // Each photo-data payload starts with a four-byte chunk address.
-                val imageStart = 9
-                if (receiving && payloadEnd > imageStart) {
-                    buffer.write(packet, imageStart, payloadEnd - imageStart)
+                if (!receiving || payloadEnd <= IMAGE_BYTES_START) return null
+                val offset = readUnsignedOffset(packet)
+                val imageBytes = packet.copyOfRange(IMAGE_BYTES_START, payloadEnd)
+                if (offset == null || offset.toLong() + imageBytes.size > MAX_TRANSFER_BYTES) {
+                    invalid = true
+                    return null
+                }
+
+                val existing = chunksByOffset[offset]
+                if (existing == null) {
+                    chunksByOffset[offset] = imageBytes
+                } else if (!existing.contentEquals(imageBytes)) {
+                    invalid = true
                 }
                 null
             }
 
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END -> {
                 if (!receiving) return null
-                receiving = false
-                buffer.toByteArray().takeIf { it.isNotEmpty() }.also { buffer.reset() }
+                val image = assembleImage()
+                resetTransfer()
+                image
             }
 
             else -> null
@@ -408,7 +425,39 @@ class EyevuePhotoAssembler {
     }
 
     fun reset() {
+        resetTransfer()
+    }
+
+    private fun assembleImage(): ByteArray? {
+        if (invalid || chunksByOffset.isEmpty()) return null
+        val totalSize = chunksByOffset.entries.maxOf { (offset, bytes) -> offset + bytes.size }
+        if (totalSize <= 0 || totalSize > MAX_TRANSFER_BYTES) return null
+
+        val image = ByteArray(totalSize)
+        val written = BooleanArray(totalSize)
+        for ((offset, bytes) in chunksByOffset) {
+            for (index in bytes.indices) {
+                val destination = offset + index
+                if (written[destination] && image[destination] != bytes[index]) return null
+                image[destination] = bytes[index]
+                written[destination] = true
+            }
+        }
+        return image.takeIf { written.all { byteWasWritten -> byteWasWritten } }
+    }
+
+    private fun readUnsignedOffset(packet: ByteArray): Int? {
+        if (packet.size < IMAGE_BYTES_START) return null
+        val value = ((packet[DATA_OFFSET_START].toLong() and 0xFF) shl 24) or
+            ((packet[DATA_OFFSET_START + 1].toLong() and 0xFF) shl 16) or
+            ((packet[DATA_OFFSET_START + 2].toLong() and 0xFF) shl 8) or
+            (packet[DATA_OFFSET_START + 3].toLong() and 0xFF)
+        return value.takeIf { it <= Int.MAX_VALUE }?.toInt()
+    }
+
+    private fun resetTransfer() {
         receiving = false
-        buffer.reset()
+        invalid = false
+        chunksByOffset.clear()
     }
 }
