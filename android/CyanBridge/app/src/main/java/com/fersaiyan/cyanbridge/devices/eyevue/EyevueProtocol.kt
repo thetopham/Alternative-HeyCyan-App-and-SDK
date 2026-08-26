@@ -381,7 +381,12 @@ class EyevuePhotoAssembler {
         const val MAX_TRANSFER_CHUNKS = 65_536
     }
 
-    private val chunksByOffset = sortedMapOf<Int, ByteArray>()
+    private data class PhotoChunk(
+        val offset: Int,
+        val bytes: ByteArray,
+    )
+
+    private val chunks = mutableListOf<PhotoChunk>()
     private var receiving = false
     private var invalid = false
     private var announcedMinimumBytes: Int? = null
@@ -410,19 +415,19 @@ class EyevuePhotoAssembler {
                     return null
                 }
 
-                val existing = chunksByOffset[offset]
-                if (existing == null) {
+                val exactDuplicate = chunks.any { chunk ->
+                    chunk.offset == offset && chunk.bytes.contentEquals(imageBytes)
+                }
+                if (!exactDuplicate) {
                     if (
-                        chunksByOffset.size >= MAX_TRANSFER_CHUNKS ||
+                        chunks.size >= MAX_TRANSFER_CHUNKS ||
                         storedChunkBytes.toLong() + imageBytes.size > MAX_TRANSFER_BYTES
                     ) {
                         invalid = true
                     } else {
-                        chunksByOffset[offset] = imageBytes
+                        chunks += PhotoChunk(offset, imageBytes)
                         storedChunkBytes += imageBytes.size
                     }
-                } else if (!existing.contentEquals(imageBytes)) {
-                    invalid = true
                 }
                 null
             }
@@ -443,31 +448,35 @@ class EyevuePhotoAssembler {
     }
 
     private fun assembleImage(): ByteArray? {
-        if (invalid || chunksByOffset.isEmpty()) return null
+        if (invalid || chunks.isEmpty()) return null
+        val ordered = chunks.sortedWith(
+            compareBy<PhotoChunk> { chunk -> chunk.offset }
+                .thenBy { chunk -> chunk.bytes.size },
+        )
 
         var contiguousEnd = 0
-        for ((offset, bytes) in chunksByOffset) {
-            if (offset > contiguousEnd) return null
-            contiguousEnd = maxOf(contiguousEnd, offset + bytes.size)
+        for (chunk in ordered) {
+            if (chunk.offset > contiguousEnd) return null
+            contiguousEnd = maxOf(contiguousEnd, chunk.offset + chunk.bytes.size)
         }
         if (contiguousEnd <= 0 || contiguousEnd > MAX_TRANSFER_BYTES) return null
         if (announcedMinimumBytes?.let { contiguousEnd < it } == true) return null
 
         val image = ByteArray(contiguousEnd)
         var writtenEnd = 0
-        for ((offset, bytes) in chunksByOffset) {
-            val overlap = (writtenEnd - offset).coerceIn(0, bytes.size)
+        for (chunk in ordered) {
+            val overlap = (writtenEnd - chunk.offset).coerceIn(0, chunk.bytes.size)
             for (index in 0 until overlap) {
-                if (image[offset + index] != bytes[index]) return null
+                if (image[chunk.offset + index] != chunk.bytes[index]) return null
             }
-            if (overlap < bytes.size) {
-                bytes.copyInto(
+            if (overlap < chunk.bytes.size) {
+                chunk.bytes.copyInto(
                     destination = image,
-                    destinationOffset = offset + overlap,
+                    destinationOffset = chunk.offset + overlap,
                     startIndex = overlap,
                 )
             }
-            writtenEnd = maxOf(writtenEnd, offset + bytes.size)
+            writtenEnd = maxOf(writtenEnd, chunk.offset + chunk.bytes.size)
         }
         return image.takeIf(::hasCompleteJpegMarkers)
     }
@@ -499,6 +508,6 @@ class EyevuePhotoAssembler {
         invalid = false
         announcedMinimumBytes = null
         storedChunkBytes = 0
-        chunksByOffset.clear()
+        chunks.clear()
     }
 }

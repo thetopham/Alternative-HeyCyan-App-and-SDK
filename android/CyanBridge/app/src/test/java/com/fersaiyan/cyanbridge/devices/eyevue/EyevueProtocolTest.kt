@@ -139,6 +139,31 @@ class EyevueProtocolTest {
     }
 
     @Test
+    fun photoAssemblerAcceptsCompatibleSameStartExtension() {
+        val assembler = EyevuePhotoAssembler()
+        assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
+        assembler.append(
+            photoDataPacket(
+                offset = 0,
+                bytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte()),
+            ),
+        )
+        assembler.append(
+            photoDataPacket(
+                offset = 0,
+                bytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0x01, 0xFF.toByte(), 0xD9.toByte()),
+            ),
+        )
+
+        val image = assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END))
+
+        assertArrayEquals(
+            byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0x01, 0xFF.toByte(), 0xD9.toByte()),
+            image,
+        )
+    }
+
+    @Test
     fun photoAssemblerRejectsConflictingOverlapAcrossOffsets() {
         val assembler = EyevuePhotoAssembler()
         assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
