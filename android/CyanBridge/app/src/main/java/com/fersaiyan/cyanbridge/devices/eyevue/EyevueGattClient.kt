@@ -187,8 +187,31 @@ class EyevueGattClient(
             value: ByteArray,
         ) {
             when (characteristic.uuid) {
-                EyevueProtocol.COMMAND_NOTIFY_UUID -> decoder.append(value).forEach(_frames::tryEmit)
-                EyevueProtocol.PHOTO_NOTIFY_UUID -> photoAssembler.append(value)?.let(_photos::tryEmit)
+                EyevueProtocol.COMMAND_NOTIFY_UUID -> {
+                    Log.i(
+                        "EyevueRaw",
+                        "AA14 len=${value.size} bytes=${value.toHexString()}",
+                    )
+                    decoder.append(value).forEach(_frames::tryEmit)
+                }
+
+                EyevueProtocol.PHOTO_NOTIFY_UUID -> {
+                    // Keep high-volume AA15 image payloads on a separate tag so normal
+                    // button/wake-word traces can capture every AA14 command without
+                    // flooding logcat with JPEG chunks.
+                    Log.d(
+                        "EyevueRawPhoto",
+                        "AA15 len=${value.size} bytes=${value.toHexString()}",
+                    )
+                    photoAssembler.append(value)?.let(_photos::tryEmit)
+                }
+
+                else -> {
+                    Log.i(
+                        "EyevueRaw",
+                        "unknown uuid=${characteristic.uuid} len=${value.size} bytes=${value.toHexString()}",
+                    )
+                }
             }
         }
     }
@@ -379,6 +402,9 @@ class EyevueGattClient(
             }
         }
     }
+
+    private fun ByteArray.toHexString(): String =
+        joinToString(" ") { byte -> "%02X".format(byte.toInt() and 0xFF) }
 
     private fun hasConnectPermission(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
