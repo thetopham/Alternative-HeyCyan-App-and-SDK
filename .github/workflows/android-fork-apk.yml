@@ -1,0 +1,81 @@
+name: Fork Android debug APK
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/android-fork-apk.yml
+      - android/**
+      - heycyan-core/**
+      - third_party/moonshine
+      - .gitmodules
+  push:
+    branches:
+      - 'eyevue-**'
+      - 'fix/**'
+    paths:
+      - .github/workflows/android-fork-apk.yml
+      - android/**
+      - heycyan-core/**
+      - third_party/moonshine
+      - .gitmodules
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: fork-android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debug-apk:
+    if: github.repository == 'thetopham/Alternative-HeyCyan-App-and-SDK'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
+        with:
+          submodules: recursive
+          lfs: false
+
+      - name: Fetch required Moonshine LFS assets
+        working-directory: third_party/moonshine
+        run: >-
+          git lfs pull
+          --include="core/speaker-embedding-model-data.cpp,core/third-party/onnxruntime/lib/android/arm64/libonnxruntime.so"
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 36 platform
+        run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;35.0.0'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Validate Tasker integration contracts
+        run: python3 tools/hil/validate_tasker_profiles.py
+
+      - name: Assemble debug APK
+        env:
+          META_GITHUB_TOKEN: ${{ github.token }}
+        working-directory: android/CyanBridge
+        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyanbridge-debug-apk-${{ github.sha }}
+          path: android/CyanBridge/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
