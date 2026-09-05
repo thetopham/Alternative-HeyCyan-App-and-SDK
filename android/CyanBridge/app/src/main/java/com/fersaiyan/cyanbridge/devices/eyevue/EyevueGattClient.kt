@@ -45,6 +45,7 @@ class EyevueGattClient(
     companion object {
         private const val TAG = "EyevueGatt"
         private const val OPERATION_TIMEOUT_MS = 10_000L
+        private const val RAW_TRACE_BYTE_LIMIT = 32
         private val ENABLE_NOTIFICATION_VALUE = byteArrayOf(0x01, 0x00)
     }
 
@@ -187,8 +188,30 @@ class EyevueGattClient(
             value: ByteArray,
         ) {
             when (characteristic.uuid) {
-                EyevueProtocol.COMMAND_NOTIFY_UUID -> decoder.append(value).forEach(_frames::tryEmit)
-                EyevueProtocol.PHOTO_NOTIFY_UUID -> photoAssembler.append(value)?.let(_photos::tryEmit)
+                EyevueProtocol.COMMAND_NOTIFY_UUID -> {
+                    Log.i(
+                        "EyevueRaw",
+                        "AA14 len=${value.size} preview=${value.toHexPreview()}",
+                    )
+                    decoder.append(value).forEach(_frames::tryEmit)
+                }
+
+                EyevueProtocol.PHOTO_NOTIFY_UUID -> {
+                    // Keep high-volume AA15 image payloads on a separate tag and cap the
+                    // preview. Full JPEG bytes belong in an explicit evidence file, not logcat.
+                    Log.d(
+                        "EyevueRawPhoto",
+                        "AA15 len=${value.size} preview=${value.toHexPreview()}",
+                    )
+                    photoAssembler.append(value)?.let(_photos::tryEmit)
+                }
+
+                else -> {
+                    Log.i(
+                        "EyevueRaw",
+                        "unknown uuid=${characteristic.uuid} len=${value.size} preview=${value.toHexPreview()}",
+                    )
+                }
             }
         }
     }
@@ -379,6 +402,15 @@ class EyevueGattClient(
             }
         }
     }
+
+    private fun ByteArray.toHexPreview(): String {
+        val visible = take(RAW_TRACE_BYTE_LIMIT)
+            .joinToString(" ") { byte -> "%02X".format(byte.toInt() and 0xFF) }
+        val omitted = size - visibleByteCount()
+        return if (omitted > 0) "$visible … (+$omitted bytes)" else visible
+    }
+
+    private fun ByteArray.visibleByteCount(): Int = minOf(size, RAW_TRACE_BYTE_LIMIT)
 
     private fun hasConnectPermission(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
