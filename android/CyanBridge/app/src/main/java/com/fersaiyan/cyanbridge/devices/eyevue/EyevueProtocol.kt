@@ -372,35 +372,71 @@ class EyevueFrameDecoder {
 
 /** Reassembles the AA15 photo stream used by the vendor's AI-photo path. */
 class EyevuePhotoAssembler {
-    private val buffer = ByteArrayOutputStream()
+    private companion object {
+        const val DATA_OFFSET_START = 5
+        const val IMAGE_BYTES_START = 9
+        const val START_SIZE_HIGH_INDEX = 7
+        const val START_SIZE_LOW_INDEX = 8
+        const val MAX_TRANSFER_BYTES = 32 * 1024 * 1024
+        const val MAX_TRANSFER_CHUNKS = 65_536
+    }
+
+    private data class PhotoChunk(
+        val offset: Int,
+        val bytes: ByteArray,
+    )
+
+    private val chunks = mutableListOf<PhotoChunk>()
     private var receiving = false
+    private var invalid = false
+    private var announcedMinimumBytes: Int? = null
+    private var storedChunkBytes = 0
 
     fun append(packet: ByteArray): ByteArray? {
         if (packet.size < 8) return null
         val commandId = packet[4].toInt() and 0xFF
         val payloadEnd = packet.size - 3
-        if (payloadEnd < 5) return null
+        if (payloadEnd < DATA_OFFSET_START) return null
 
         return when (commandId) {
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START -> {
-                buffer.reset()
+                resetTransfer()
                 receiving = true
+                announcedMinimumBytes = readAnnouncedMinimum(packet, payloadEnd)
                 null
             }
 
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA -> {
-                // Each photo-data payload starts with a four-byte chunk address.
-                val imageStart = 9
-                if (receiving && payloadEnd > imageStart) {
-                    buffer.write(packet, imageStart, payloadEnd - imageStart)
+                if (!receiving || payloadEnd <= IMAGE_BYTES_START) return null
+                val offset = readUnsignedOffset(packet)
+                val imageBytes = packet.copyOfRange(IMAGE_BYTES_START, payloadEnd)
+                if (offset == null || offset.toLong() + imageBytes.size > MAX_TRANSFER_BYTES) {
+                    invalid = true
+                    return null
+                }
+
+                val exactDuplicate = chunks.any { chunk ->
+                    chunk.offset == offset && chunk.bytes.contentEquals(imageBytes)
+                }
+                if (!exactDuplicate) {
+                    if (
+                        chunks.size >= MAX_TRANSFER_CHUNKS ||
+                        storedChunkBytes.toLong() + imageBytes.size > MAX_TRANSFER_BYTES
+                    ) {
+                        invalid = true
+                    } else {
+                        chunks += PhotoChunk(offset, imageBytes)
+                        storedChunkBytes += imageBytes.size
+                    }
                 }
                 null
             }
 
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END -> {
                 if (!receiving) return null
-                receiving = false
-                buffer.toByteArray().takeIf { it.isNotEmpty() }.also { buffer.reset() }
+                val image = assembleImage()
+                resetTransfer()
+                image
             }
 
             else -> null
@@ -408,7 +444,70 @@ class EyevuePhotoAssembler {
     }
 
     fun reset() {
+        resetTransfer()
+    }
+
+    private fun assembleImage(): ByteArray? {
+        if (invalid || chunks.isEmpty()) return null
+        val ordered = chunks.sortedWith(
+            compareBy<PhotoChunk> { chunk -> chunk.offset }
+                .thenBy { chunk -> chunk.bytes.size },
+        )
+
+        var contiguousEnd = 0
+        for (chunk in ordered) {
+            if (chunk.offset > contiguousEnd) return null
+            contiguousEnd = maxOf(contiguousEnd, chunk.offset + chunk.bytes.size)
+        }
+        if (contiguousEnd <= 0 || contiguousEnd > MAX_TRANSFER_BYTES) return null
+        if (announcedMinimumBytes?.let { contiguousEnd < it } == true) return null
+
+        val image = ByteArray(contiguousEnd)
+        var writtenEnd = 0
+        for (chunk in ordered) {
+            val overlap = (writtenEnd - chunk.offset).coerceIn(0, chunk.bytes.size)
+            for (index in 0 until overlap) {
+                if (image[chunk.offset + index] != chunk.bytes[index]) return null
+            }
+            if (overlap < chunk.bytes.size) {
+                chunk.bytes.copyInto(
+                    destination = image,
+                    destinationOffset = chunk.offset + overlap,
+                    startIndex = overlap,
+                )
+            }
+            writtenEnd = maxOf(writtenEnd, chunk.offset + chunk.bytes.size)
+        }
+        return image.takeIf(::hasCompleteJpegMarkers)
+    }
+
+    private fun hasCompleteJpegMarkers(bytes: ByteArray): Boolean =
+        bytes.size >= 4 &&
+            bytes[0] == 0xFF.toByte() &&
+            bytes[1] == 0xD8.toByte() &&
+            bytes[bytes.lastIndex - 1] == 0xFF.toByte() &&
+            bytes[bytes.lastIndex] == 0xD9.toByte()
+
+    private fun readAnnouncedMinimum(packet: ByteArray, payloadEnd: Int): Int? {
+        if (payloadEnd <= START_SIZE_LOW_INDEX) return null
+        return ((packet[START_SIZE_HIGH_INDEX].toInt() and 0xFF) shl 8) or
+            (packet[START_SIZE_LOW_INDEX].toInt() and 0xFF)
+    }
+
+    private fun readUnsignedOffset(packet: ByteArray): Int? {
+        if (packet.size < IMAGE_BYTES_START) return null
+        val value = ((packet[DATA_OFFSET_START].toLong() and 0xFF) shl 24) or
+            ((packet[DATA_OFFSET_START + 1].toLong() and 0xFF) shl 16) or
+            ((packet[DATA_OFFSET_START + 2].toLong() and 0xFF) shl 8) or
+            (packet[DATA_OFFSET_START + 3].toLong() and 0xFF)
+        return value.takeIf { it <= Int.MAX_VALUE }?.toInt()
+    }
+
+    private fun resetTransfer() {
         receiving = false
-        buffer.reset()
+        invalid = false
+        announcedMinimumBytes = null
+        storedChunkBytes = 0
+        chunks.clear()
     }
 }

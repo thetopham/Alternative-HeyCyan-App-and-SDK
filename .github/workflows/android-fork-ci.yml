@@ -1,0 +1,65 @@
+name: Fork EyeVue protocol tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/android-fork-ci.yml
+      - android/CyanBridge/app/src/main/java/com/fersaiyan/cyanbridge/devices/eyevue/**
+      - android/CyanBridge/app/src/test/java/com/fersaiyan/cyanbridge/devices/eyevue/**
+      - android/CyanBridge/eyevue-protocol-tests/**
+  push:
+    branches:
+      - main
+      - 'fix/**'
+      - 'eyevue-**'
+    paths:
+      - .github/workflows/android-fork-ci.yml
+      - android/CyanBridge/app/src/main/java/com/fersaiyan/cyanbridge/devices/eyevue/**
+      - android/CyanBridge/app/src/test/java/com/fersaiyan/cyanbridge/devices/eyevue/**
+      - android/CyanBridge/eyevue-protocol-tests/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-eyevue-protocol-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eyevue-protocol-tests:
+    if: github.repository == 'thetopham/Alternative-HeyCyan-App-and-SDK'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+          lfs: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run isolated EyeVue protocol tests
+        run: >-
+          ./android/CyanBridge/gradlew
+          -p android/CyanBridge/eyevue-protocol-tests
+          --no-daemon
+          --stacktrace
+          test
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eyevue-protocol-test-reports-${{ github.sha }}
+          path: android/CyanBridge/eyevue-protocol-tests/build/reports/tests/test/**
+          if-no-files-found: ignore
+          retention-days: 3
