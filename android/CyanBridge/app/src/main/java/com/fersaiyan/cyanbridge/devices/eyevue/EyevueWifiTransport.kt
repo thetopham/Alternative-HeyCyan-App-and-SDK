@@ -1,12 +1,10 @@
 package com.fersaiyan.cyanbridge.devices.eyevue
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -21,6 +19,7 @@ import android.os.Build
 import android.os.Looper
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.fersaiyan.cyanbridge.ui.hasWifiP2pPermission
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
@@ -167,8 +166,10 @@ class EyevueWifiTransport(
                     }
 
                     override fun onLost(network: Network) {
-                        if (boundNetwork == network) {
+                        if (apNetworkCallback === this && boundNetwork == network) {
+                            runCatching { connectivityManager.bindProcessToNetwork(null) }
                             boundNetwork = null
+                            Log.w(TAG, "Eyevue AP network was lost")
                             if (continuation.isActive) {
                                 continuation.resumeWithException(IOException("Eyevue AP network was lost"))
                             }
@@ -321,17 +322,6 @@ class EyevueWifiTransport(
             )
         }
 
-    private fun hasWifiPermission(): Boolean {
-        val nearbyGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-            ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.NEARBY_WIFI_DEVICES,
-            ) == PackageManager.PERMISSION_GRANTED
-        val locationGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
-            ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-            ) == PackageManager.PERMISSION_GRANTED
-        return nearbyGranted && locationGranted
-    }
+    // Match the permission requested by the UI: Nearby Wi-Fi on Android 13+, location before it.
+    private fun hasWifiPermission(): Boolean = hasWifiP2pPermission(context)
 }

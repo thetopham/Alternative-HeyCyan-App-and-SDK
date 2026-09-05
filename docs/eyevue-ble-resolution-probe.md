@@ -36,3 +36,28 @@ For the first test, end other voice/audio sessions and compare all three command
 If a usable image mode is found, repeat during an existing Live Voice call to check
 steady Bluetooth-audio coexistence. Keep raw frames and captured images private;
 publish only protocol metadata and verified dimensions in a result note.
+
+## S25 physical results (2026-09-05)
+
+Build 95ae4f4 (version 23) returned an intact 320x180 JPEG, 13,340 bytes in
+3,533 ms, for the baseline shutter. Both 0x36 values replied on AA14 but
+returned no AA15 image within 120 seconds each. The user then took an ordinary
+photo using the glasses button: reported stored-photo count increased from
+20 to 21. Both pull values were repeated and again timed out in 120 seconds
+with no complete image. No higher-resolution BLE mode has been demonstrated.
+
+The same build fixed reception of the observed AC55 control replies. The
+project now decodes to TK8 and selects the vendor T-series AP media profile.
+A subsequent Wi-Fi sync received the glasses SSID, then failed in
+EyevueWifiTransport's own permission gate before joining the AP: the transport
+required Fine Location as well as Nearby Wi-Fi, while the Android 13+ UI only
+requested Nearby Wi-Fi. Nearby was granted and Fine Location was not.
+
+Version 24 reuses the UI's existing permission helper to remove that mismatch.
+It also explicitly unbinds process routing when the active AP network is lost.
+Wi-Fi connection modes, addresses, endpoints, and timing remain unchanged.
+Full Wi-Fi download and original-image dimensions still require physical
+verification; correcting the permission gate is not proof of a working transfer.
+
+Raw phone logs, app data backups, and captured photos remain private and are
+not included in this repository.
