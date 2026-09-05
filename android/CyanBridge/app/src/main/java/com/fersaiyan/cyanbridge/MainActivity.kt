@@ -3741,6 +3741,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return
         }
         if (isGlassesCommandBlocked(source)) return
+        if (isEyevueSelected()) {
+            Log.d("AIHijack", "Requesting native Eyevue AI-audio stop ($source)")
+            getOrCreateEyevueManager().stopVoiceRecognition()
+            return
+        }
         val permit = acquireBackgroundGlassesCommand(source) ?: return
         try {
             LargeDataHandler.getInstance().glassesControl(byteArrayOf(0x02, 0x01, 0x0b)) { _, _ ->

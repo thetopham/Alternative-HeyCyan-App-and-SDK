@@ -61,3 +61,15 @@ verification; correcting the permission gate is not proof of a working transfer.
 
 Raw phone logs, app data backups, and captured photos remain private and are
 not included in this repository.
+
+Follow-up Wi-Fi testing on version 23, with the missing permission temporarily
+granted, passed SSID retrieval but Android returned AP-network-unavailable. The
+glasses advertised WPA2-PSK/CCMP with a strong signal; the S25 driver logged
+`auth_no_resp_received` during association attempts. HTTP was not reached.
+
+A separate stuck-command gate was cleared by restarting CyanBridge. Source
+review found EyeVue AI-audio cleanup calling the legacy Oudmon command API,
+whose permit remains held when no response arrives. Version 24 routes EyeVue
+cleanup to its native stop-voice command before any legacy permit is acquired.
+The older logs needed to attribute the exact stuck instance were no longer
+available; the wrong-protocol cleanup path itself is confirmed in source.
