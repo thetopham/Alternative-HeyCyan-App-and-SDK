@@ -51,14 +51,21 @@ class EyevueGattClient(
 
     private val operationMutex = Mutex()
     private val decoder = EyevueFrameDecoder()
-    private val photoAssembler = EyevuePhotoAssembler()
     private val _state = MutableStateFlow(EyevueGattState.DISCONNECTED)
     private val _frames = MutableSharedFlow<EyevueFrame>(extraBufferCapacity = 64)
     private val _photos = MutableSharedFlow<ByteArray>(extraBufferCapacity = 1)
+    private val _photoResults = MutableSharedFlow<Result<ByteArray>>(extraBufferCapacity = 1)
+    private val photoAssembler = EyevuePhotoAssembler { reason ->
+        Log.w(TAG, "Photo transfer rejected: $reason")
+        if (!_photoResults.tryEmit(Result.failure(IOException("Eyevue photo was incomplete: $reason")))) {
+            Log.w(TAG, "Photo rejection could not be delivered to the capture listener")
+        }
+    }
 
     val state: StateFlow<EyevueGattState> = _state.asStateFlow()
     val frames: SharedFlow<EyevueFrame> = _frames.asSharedFlow()
     val photos: SharedFlow<ByteArray> = _photos.asSharedFlow()
+    val photoResults: SharedFlow<Result<ByteArray>> = _photoResults.asSharedFlow()
 
     @Volatile
     private var gatt: BluetoothGatt? = null
@@ -203,7 +210,13 @@ class EyevueGattClient(
                         "EyevueRawPhoto",
                         "AA15 len=${value.size} preview=${value.toHexPreview()}",
                     )
-                    photoAssembler.append(value)?.let(_photos::tryEmit)
+                    photoAssembler.append(value)?.let { image ->
+                        Log.i(TAG, "Photo assembled: bytes=${image.size}")
+                        _photos.tryEmit(image)
+                        if (!_photoResults.tryEmit(Result.success(image))) {
+                            Log.w(TAG, "Completed photo could not be delivered to the capture listener")
+                        }
+                    }
                 }
 
                 else -> {

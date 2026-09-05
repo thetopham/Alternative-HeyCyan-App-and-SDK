@@ -371,27 +371,34 @@ class EyevueFrameDecoder {
 }
 
 /** Reassembles the AA15 photo stream used by the vendor's AI-photo path. */
-class EyevuePhotoAssembler {
+class EyevuePhotoAssembler(
+    private val onTransferRejected: (String) -> Unit = {},
+) {
     private companion object {
         const val DATA_OFFSET_START = 5
         const val IMAGE_BYTES_START = 9
-        const val START_SIZE_HIGH_INDEX = 7
-        const val START_SIZE_LOW_INDEX = 8
         const val MAX_TRANSFER_BYTES = 32 * 1024 * 1024
         const val MAX_TRANSFER_CHUNKS = 65_536
+        const val UINT32_MASK = 0xFFFF_FFFFL
     }
 
     private data class PhotoChunk(
+        val rawOffset: Long,
+        val bytes: ByteArray,
+    )
+
+    private data class RelativeChunk(
         val offset: Int,
         val bytes: ByteArray,
     )
 
     private val chunks = mutableListOf<PhotoChunk>()
     private var receiving = false
-    private var invalid = false
-    private var announcedMinimumBytes: Int? = null
+    private var invalidReason: String? = null
+    private var announcedBytes: Int? = null
     private var storedChunkBytes = 0
 
+    @Synchronized
     fun append(packet: ByteArray): ByteArray? {
         if (packet.size < 8) return null
         val commandId = packet[4].toInt() and 0xFF
@@ -402,30 +409,35 @@ class EyevuePhotoAssembler {
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START -> {
                 resetTransfer()
                 receiving = true
-                announcedMinimumBytes = readAnnouncedMinimum(packet, payloadEnd)
+                if (payloadEnd >= IMAGE_BYTES_START) {
+                    // S25 traces announce the wire byte count (including word padding)
+                    // as a four-byte big-endian value, followed by a format byte.
+                    val size = readUnsigned32(packet, DATA_OFFSET_START)
+                    if (size !in 1L..MAX_TRANSFER_BYTES.toLong()) {
+                        invalidReason = "invalid_announced_size value=" + size
+                    } else {
+                        announcedBytes = size.toInt()
+                    }
+                }
                 null
             }
 
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA -> {
                 if (!receiving || payloadEnd <= IMAGE_BYTES_START) return null
-                val offset = readUnsignedOffset(packet)
+                if (invalidReason != null) return null
+                val rawOffset = readUnsigned32(packet, DATA_OFFSET_START)
                 val imageBytes = packet.copyOfRange(IMAGE_BYTES_START, payloadEnd)
-                if (offset == null || offset.toLong() + imageBytes.size > MAX_TRANSFER_BYTES) {
-                    invalid = true
-                    return null
-                }
-
                 val exactDuplicate = chunks.any { chunk ->
-                    chunk.offset == offset && chunk.bytes.contentEquals(imageBytes)
+                    chunk.rawOffset == rawOffset && chunk.bytes.contentEquals(imageBytes)
                 }
                 if (!exactDuplicate) {
                     if (
                         chunks.size >= MAX_TRANSFER_CHUNKS ||
                         storedChunkBytes.toLong() + imageBytes.size > MAX_TRANSFER_BYTES
                     ) {
-                        invalid = true
+                        invalidReason = "transfer_limit"
                     } else {
-                        chunks += PhotoChunk(offset, imageBytes)
+                        chunks += PhotoChunk(rawOffset, imageBytes)
                         storedChunkBytes += imageBytes.size
                     }
                 }
@@ -434,40 +446,75 @@ class EyevuePhotoAssembler {
 
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END -> {
                 if (!receiving) return null
-                val image = assembleImage()
-                resetTransfer()
-                image
+                try {
+                    assembleImage()
+                } finally {
+                    resetTransfer()
+                }
             }
 
             else -> null
         }
     }
 
+    @Synchronized
     fun reset() {
         resetTransfer()
     }
 
     private fun assembleImage(): ByteArray? {
-        if (invalid || chunks.isEmpty()) return null
-        val ordered = chunks.sortedWith(
-            compareBy<PhotoChunk> { chunk -> chunk.offset }
-                .thenBy { chunk -> chunk.bytes.size },
-        )
+        invalidReason?.let { return reject(it) }
+        if (chunks.isEmpty()) return reject("no_data")
+
+        // The glasses retain an unsigned 32-bit byte counter between photos.
+        // Find the beginning of this bounded interval on the counter's circle,
+        // independent of arrival order and even when the counter rolls over.
+        val rawOrdered = chunks.sortedBy { it.rawOffset }
+        val originIndex = rawOrdered.indices.maxBy { index ->
+            val previous = rawOrdered[(index + rawOrdered.size - 1) % rawOrdered.size]
+            (rawOrdered[index].rawOffset - previous.rawOffset) and UINT32_MASK
+        }
+        val origin = rawOrdered[originIndex].rawOffset
+        if (origin != 0L && announcedBytes == null) {
+            return reject("missing_size_for_rebase base=" + origin)
+        }
+        val ordered = mutableListOf<RelativeChunk>()
+        for (chunk in chunks) {
+            val relativeOffset = (chunk.rawOffset - origin) and UINT32_MASK
+            if (relativeOffset + chunk.bytes.size > MAX_TRANSFER_BYTES) {
+                return reject("offset_span_limit base=" + origin)
+            }
+            ordered += RelativeChunk(relativeOffset.toInt(), chunk.bytes)
+        }
+        ordered.sortWith(compareBy<RelativeChunk> { it.offset }.thenBy { it.bytes.size })
 
         var contiguousEnd = 0
         for (chunk in ordered) {
-            if (chunk.offset > contiguousEnd) return null
+            if (chunk.offset > contiguousEnd) {
+                return reject(
+                    "gap offset=" + contiguousEnd + " next=" + chunk.offset +
+                        " missing=" + (chunk.offset - contiguousEnd),
+                )
+            }
             contiguousEnd = maxOf(contiguousEnd, chunk.offset + chunk.bytes.size)
         }
-        if (contiguousEnd <= 0 || contiguousEnd > MAX_TRANSFER_BYTES) return null
-        if (announcedMinimumBytes?.let { contiguousEnd < it } == true) return null
+        if (contiguousEnd <= 0 || contiguousEnd > MAX_TRANSFER_BYTES) {
+            return reject("invalid_span bytes=" + contiguousEnd)
+        }
+        // Exact coverage prevents a missing initial chunk from being rebased to
+        // an incidental JPEG marker later in the payload.
+        if (announcedBytes?.let { contiguousEnd != it } == true) {
+            return reject("size_mismatch actual=" + contiguousEnd)
+        }
 
         val image = ByteArray(contiguousEnd)
         var writtenEnd = 0
         for (chunk in ordered) {
             val overlap = (writtenEnd - chunk.offset).coerceIn(0, chunk.bytes.size)
             for (index in 0 until overlap) {
-                if (image[chunk.offset + index] != chunk.bytes[index]) return null
+                if (image[chunk.offset + index] != chunk.bytes[index]) {
+                    return reject("overlap_conflict offset=" + (chunk.offset + index))
+                }
             }
             if (overlap < chunk.bytes.size) {
                 chunk.bytes.copyInto(
@@ -478,35 +525,45 @@ class EyevuePhotoAssembler {
             }
             writtenEnd = maxOf(writtenEnd, chunk.offset + chunk.bytes.size)
         }
-        return image.takeIf(::hasCompleteJpegMarkers)
+        if (image.size < 4 || image[0] != 0xFF.toByte() || image[1] != 0xD8.toByte()) {
+            return reject("missing_jpeg_start base=" + origin)
+        }
+
+        var jpegEnd = image.size
+        while (jpegEnd > 0 && image[jpegEnd - 1] == 0.toByte()) jpegEnd--
+        val padding = image.size - jpegEnd
+        if (padding > 3 || (padding > 0 && (announcedBytes == null || image.size % 4 != 0))) {
+            return reject("invalid_padding bytes=" + padding)
+        }
+        if (
+            jpegEnd < 4 ||
+            image[jpegEnd - 2] != 0xFF.toByte() ||
+            image[jpegEnd - 1] != 0xD9.toByte()
+        ) {
+            return reject("missing_jpeg_end padding=" + padding)
+        }
+        // Only remove confirmed terminal zero alignment, never interior bytes.
+        return if (padding == 0) image else image.copyOf(jpegEnd)
     }
 
-    private fun hasCompleteJpegMarkers(bytes: ByteArray): Boolean =
-        bytes.size >= 4 &&
-            bytes[0] == 0xFF.toByte() &&
-            bytes[1] == 0xD8.toByte() &&
-            bytes[bytes.lastIndex - 1] == 0xFF.toByte() &&
-            bytes[bytes.lastIndex] == 0xD9.toByte()
-
-    private fun readAnnouncedMinimum(packet: ByteArray, payloadEnd: Int): Int? {
-        if (payloadEnd <= START_SIZE_LOW_INDEX) return null
-        return ((packet[START_SIZE_HIGH_INDEX].toInt() and 0xFF) shl 8) or
-            (packet[START_SIZE_LOW_INDEX].toInt() and 0xFF)
+    private fun reject(reason: String): ByteArray? {
+        onTransferRejected(
+            reason + " chunks=" + chunks.size + " stored=" + storedChunkBytes +
+                " announced=" + (announcedBytes?.toString() ?: "unknown"),
+        )
+        return null
     }
 
-    private fun readUnsignedOffset(packet: ByteArray): Int? {
-        if (packet.size < IMAGE_BYTES_START) return null
-        val value = ((packet[DATA_OFFSET_START].toLong() and 0xFF) shl 24) or
-            ((packet[DATA_OFFSET_START + 1].toLong() and 0xFF) shl 16) or
-            ((packet[DATA_OFFSET_START + 2].toLong() and 0xFF) shl 8) or
-            (packet[DATA_OFFSET_START + 3].toLong() and 0xFF)
-        return value.takeIf { it <= Int.MAX_VALUE }?.toInt()
-    }
+    private fun readUnsigned32(packet: ByteArray, start: Int): Long =
+        ((packet[start].toLong() and 0xFF) shl 24) or
+            ((packet[start + 1].toLong() and 0xFF) shl 16) or
+            ((packet[start + 2].toLong() and 0xFF) shl 8) or
+            (packet[start + 3].toLong() and 0xFF)
 
     private fun resetTransfer() {
         receiving = false
-        invalid = false
-        announcedMinimumBytes = null
+        invalidReason = null
+        announcedBytes = null
         storedChunkBytes = 0
         chunks.clear()
     }

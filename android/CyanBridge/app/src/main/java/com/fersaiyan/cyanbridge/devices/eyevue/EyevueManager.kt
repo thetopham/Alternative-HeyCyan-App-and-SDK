@@ -137,10 +137,17 @@ class EyevueManager private constructor(context: Context) {
     )
 
     suspend fun capturePhotoForAi(timeoutMs: Long = 12_000L): ByteArray? = coroutineScope {
-        val photo = async(start = CoroutineStart.UNDISPATCHED) { client.photos.first() }
-        takePhoto(highQuality = true)
-        withTimeoutOrNull(timeoutMs) { photo.await() }.also {
-            if (it == null) photo.cancel()
+        // Subscribe before issuing the command, and surface rejected transfers and
+        // write failures immediately instead of turning every failure into a timeout.
+        val photo = async(start = CoroutineStart.UNDISPATCHED) { client.photoResults.first() }
+        try {
+            withTimeoutOrNull(timeoutMs) {
+                client.write(EyevueProtocol.buildPhotoPacket(highQuality = true)).getOrThrow()
+                Log.d(TAG, "Eyevue command sent: take photo")
+                photo.await().getOrThrow()
+            }
+        } finally {
+            photo.cancel()
         }
     }
 

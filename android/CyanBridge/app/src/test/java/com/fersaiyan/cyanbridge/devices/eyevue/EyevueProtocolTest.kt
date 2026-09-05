@@ -167,8 +167,8 @@ class EyevueProtocolTest {
     fun photoAssemblerRejectsConflictingOverlapAcrossOffsets() {
         val assembler = EyevuePhotoAssembler()
         assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
-        assembler.append(photoDataPacket(offset = 0, bytes = byteArrayOf(0x01, 0x02, 0x03)))
-        assembler.append(photoDataPacket(offset = 2, bytes = byteArrayOf(0x09, 0x04)))
+        assembler.append(photoDataPacket(offset = 0, bytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0x03)))
+        assembler.append(photoDataPacket(offset = 2, bytes = byteArrayOf(0x09, 0xFF.toByte(), 0xD9.toByte())))
 
         val image = assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END))
 
@@ -190,7 +190,7 @@ class EyevueProtocolTest {
     @Test
     fun photoAssemblerRejectsContiguousPrefixWithoutJpegEndMarker() {
         val assembler = EyevuePhotoAssembler()
-        assembler.append(photoStartPacket(announcedMinimumBytes = 2))
+        assembler.append(photoStartPacket(announcedBytes = 2))
         assembler.append(
             photoDataPacket(
                 offset = 0,
@@ -226,19 +226,255 @@ class EyevueProtocolTest {
         )
     }
 
-    private fun photoStartPacket(announcedMinimumBytes: Int): ByteArray =
+    @Test
+    fun photoAssemblerAcceptsConsecutiveCumulativeCountersFromS25Trace() {
+        val assembler = EyevuePhotoAssembler()
+        val bases = listOf(0L, 10_344L, 20_356L, 30_292L)
+        val sizes = listOf(10_344, 10_012, 9_936, 10_284)
+        for ((base, size) in bases.zip(sizes)) {
+            val wireImage = alignedWireImage(size, padding = 3)
+            assembler.append(photoStartPacket(size))
+            appendWireImage(assembler, base, wireImage)
+            assertArrayEquals(
+                wireImage.copyOf(size - 3),
+                assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+            )
+        }
+    }
+
+    @Test
+    fun photoAssemblerRebasesOutOfOrderChunksWithoutUsingArrivalOrder() {
+        val assembler = EyevuePhotoAssembler()
+        val wireImage = alignedWireImage(8, padding = 0)
+        assembler.append(photoStartPacket(wireImage.size))
+        assembler.append(photoDataPacket(10_348, wireImage.copyOfRange(4, 8)))
+        assembler.append(photoDataPacket(10_344, wireImage.copyOfRange(0, 4)))
+        assertArrayEquals(
+            wireImage,
+            assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+        )
+    }
+
+    @Test
+    fun photoAssemblerHandlesUnsignedCounterRolloverOutOfOrder() {
+        val assembler = EyevuePhotoAssembler()
+        val wireImage = alignedWireImage(8, padding = 0)
+        assembler.append(photoStartPacket(wireImage.size))
+        assembler.append(photoDataPacket(2, wireImage.copyOfRange(4, 8)))
+        assembler.append(photoDataPacket(0xFFFF_FFFEL, wireImage.copyOfRange(0, 4)))
+        assertArrayEquals(
+            wireImage,
+            assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+        )
+    }
+
+    @Test
+    fun photoAssemblerAppliesMemoryLimitToPhotoNotCumulativeCounter() {
+        val assembler = EyevuePhotoAssembler()
+        val wireImage = alignedWireImage(8, padding = 0)
+        assembler.append(photoStartPacket(wireImage.size))
+        assembler.append(photoDataPacket(0xF000_0000L, wireImage))
+        assertArrayEquals(
+            wireImage,
+            assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+        )
+    }
+
+    @Test
+    fun photoAssemblerRejectsMissingInitialChunkWithIncidentalJpegMarker() {
+        val rejected = mutableListOf<String>()
+        val assembler = EyevuePhotoAssembler(rejected::add)
+        assembler.append(photoStartPacket(12))
+        // A later payload could coincidentally start with SOI. It is still not
+        // the entire announced transfer and must not become a replacement origin.
+        assembler.append(photoDataPacket(10_348, alignedWireImage(8, padding = 0)))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+        assertTrue(rejected.single().startsWith("size_mismatch"))
+    }
+
+    @Test
+    fun photoAssemblerRejectsRebaseWithoutAnnouncedSize() {
+        val assembler = EyevuePhotoAssembler()
+        assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
+        assembler.append(photoDataPacket(4, alignedWireImage(8, padding = 0)))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+    }
+
+    @Test
+    fun photoAssemblerRejectsMissingJpegStartEvenWhenSizeMatches() {
+        val assembler = EyevuePhotoAssembler()
+        val wireImage = alignedWireImage(8, padding = 0).also { it[0] = 0x7F }
+        assembler.append(photoStartPacket(wireImage.size))
+        assembler.append(photoDataPacket(10_344, wireImage))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+    }
+
+    @Test
+    fun photoAssemblerPreservesGapRejectionAfterRebaseWithUsefulDiagnostics() {
+        val rejected = mutableListOf<String>()
+        val assembler = EyevuePhotoAssembler(rejected::add)
+        val wireImage = alignedWireImage(10_344, padding = 3)
+        assembler.append(photoStartPacket(wireImage.size))
+        appendWireImage(assembler, 10_344, wireImage, skipOffset = 4_960)
+        assertTrue(rejected.isEmpty())
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+        assertTrue(rejected.single().contains("gap offset=4960 next=5456 missing=496"))
+        assertTrue(rejected.single().contains("announced=10344"))
+        assertTrue(rejected.single().contains("chunks="))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+        assertEquals(1, rejected.size)
+    }
+
+    @Test
+    fun photoAssemblerAcceptsOnlyBoundedZeroWordPadding() {
+        for (padding in 0..3) {
+            val assembler = EyevuePhotoAssembler()
+            val wireImage = alignedWireImage(8, padding)
+            assembler.append(photoStartPacket(wireImage.size))
+            assembler.append(photoDataPacket(10_344, wireImage))
+            assertArrayEquals(
+                wireImage.copyOf(wireImage.size - padding),
+                assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+            )
+        }
+    }
+
+    @Test
+    fun photoAssemblerUsesS25TerminalPacketLayoutAndPreservesInteriorBytes() {
+        val assembler = EyevuePhotoAssembler()
+        val wireImage = alignedWireImage(9_936, padding = 3)
+        val syntheticTail = byteArrayOf(
+            0x11, 0x22, 0x33, 0xFF.toByte(), 0,
+            0x44, 0x55, 0x66, 0x77, 0x12, 0x34,
+            0xFF.toByte(), 0xD9.toByte(), 0, 0, 0,
+        )
+        syntheticTail.copyInto(wireImage, wireImage.size - syntheticTail.size)
+        assembler.append(photoStartPacket(wireImage.size))
+        appendWireImage(assembler, 20_356, wireImage)
+        assertArrayEquals(
+            wireImage.copyOf(9_933),
+            assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+        )
+    }
+
+    @Test
+    fun photoAssemblerRejectsExcessOrNonzeroTrailingBytes() {
+        val invalidImages = listOf(
+            byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte(), 0, 0, 0, 0),
+            byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte(), 1, 0, 0, 0),
+        )
+        for (wireImage in invalidImages) {
+            val assembler = EyevuePhotoAssembler()
+            assembler.append(photoStartPacket(wireImage.size))
+            assembler.append(photoDataPacket(10_344, wireImage))
+            assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+        }
+    }
+
+    @Test
+    fun photoAssemblerRejectsPaddingWithoutAnnouncedWordAlignment() {
+        val image = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte(), 0)
+        val assembler = EyevuePhotoAssembler()
+        assembler.append(photoStartPacket(image.size))
+        assembler.append(photoDataPacket(0, image))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+        assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))
+        assembler.append(photoDataPacket(0, alignedWireImage(8, padding = 3)))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+    }
+
+    @Test
+    fun photoAssemblerUsesAllFourAnnouncedSizeBytes() {
+        val assembler = EyevuePhotoAssembler()
+        assembler.append(photoStartPacket(65_540))
+        assembler.append(photoDataPacket(0, byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte())))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+
+        val wireImage = alignedWireImage(65_540, padding = 0)
+        assembler.append(photoStartPacket(wireImage.size))
+        appendWireImage(assembler, 0, wireImage)
+        assertArrayEquals(
+            wireImage,
+            assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+        )
+    }
+
+    @Test
+    fun photoAssemblerRejectsDeclaredOrRelativeSpanBeyondLimit() {
+        val rejected = mutableListOf<String>()
+        val assembler = EyevuePhotoAssembler(rejected::add)
+        assembler.append(photoStartPacket(32 * 1024 * 1024 + 1))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+        assertTrue(rejected.last().startsWith("invalid_announced_size"))
+
+        assembler.append(photoStartPacket(8))
+        assembler.append(photoDataPacket(0, byteArrayOf(0xFF.toByte(), 0xD8.toByte())))
+        assembler.append(photoDataPacket(32L * 1024 * 1024, byteArrayOf(0xFF.toByte(), 0xD9.toByte())))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+        assertTrue(rejected.last().startsWith("offset_span_limit"))
+    }
+
+    @Test
+    fun photoAssemblerKeepsConflictChecksAfterRolloverAndResetsAfterFailure() {
+        val rejected = mutableListOf<String>()
+        val assembler = EyevuePhotoAssembler(rejected::add)
+        val wireImage = alignedWireImage(8, padding = 0)
+        assembler.append(photoStartPacket(wireImage.size))
+        assembler.append(photoDataPacket(0xFFFF_FFFCL, wireImage))
+        assembler.append(photoDataPacket(0, byteArrayOf(0x01)))
+        assertEquals(null, assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)))
+        assertTrue(rejected.single().startsWith("overlap_conflict offset=4"))
+
+        assembler.append(photoStartPacket(wireImage.size))
+        assembler.append(photoDataPacket(20_356, wireImage))
+        assertArrayEquals(
+            wireImage,
+            assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_END)),
+        )
+        assertEquals(1, rejected.size)
+    }
+
+    private fun alignedWireImage(size: Int, padding: Int): ByteArray {
+        require(size - padding >= 4)
+        return ByteArray(size) { 0x5A.toByte() }.also { image ->
+            image[0] = 0xFF.toByte()
+            image[1] = 0xD8.toByte()
+            image[size - padding - 2] = 0xFF.toByte()
+            image[size - padding - 1] = 0xD9.toByte()
+            for (index in size - padding until size) image[index] = 0
+        }
+    }
+
+    private fun appendWireImage(
+        assembler: EyevuePhotoAssembler,
+        base: Long,
+        image: ByteArray,
+        skipOffset: Int? = null,
+    ) {
+        for (offset in image.indices step 496) {
+            if (offset == skipOffset) continue
+            assembler.append(
+                photoDataPacket(
+                    (base + offset) and 0xFFFF_FFFFL,
+                    image.copyOfRange(offset, minOf(offset + 496, image.size)),
+                ),
+            )
+        }
+    }
+
+    private fun photoStartPacket(announcedBytes: Int): ByteArray =
         photoPacket(
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START,
             byteArrayOf(
-                0,
-                0,
-                ((announcedMinimumBytes ushr 8) and 0xFF).toByte(),
-                (announcedMinimumBytes and 0xFF).toByte(),
-                0,
+                ((announcedBytes ushr 24) and 0xFF).toByte(),
+                ((announcedBytes ushr 16) and 0xFF).toByte(),
+                ((announcedBytes ushr 8) and 0xFF).toByte(),
+                (announcedBytes and 0xFF).toByte(),
+                2,
             ),
         )
 
-    private fun photoDataPacket(offset: Int, bytes: ByteArray): ByteArray =
+    private fun photoDataPacket(offset: Long, bytes: ByteArray): ByteArray =
         photoPacket(
             EyevueProtocol.CMD_RECEIVE_PHOTO_DATA,
             byteArrayOf(
