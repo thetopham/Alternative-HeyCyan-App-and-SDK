@@ -4575,7 +4575,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         prepareAiQuestionForLockScreen()
         beginAiQuestionForegroundWork("Capturing image from Eyevue glasses")
         pendingImageQuestionOfferSpokenQuestion = false
-        startParallelAudioQuestionIfEligible(offerSpokenQuestion)
+        // Avoid SCO microphone setup during EyeVue BLE transfer: phone traces showed
+        // packet gaps during concurrent capture. Offer audio after the image arrives.
+        cancelParallelAudioQuestion()
         val startedAt = System.currentTimeMillis()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
@@ -4588,8 +4590,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         imagePath = imageFile.absolutePath,
                         source = ImageQuestionSource.HIGH_QUALITY,
                         transferDurationMs = System.currentTimeMillis() - startedAt,
+                        offerSpokenQuestion = offerSpokenQuestion,
                     )
                 }
+            } catch (cancelled: CancellationException) {
+                withContext(Dispatchers.Main + kotlinx.coroutines.NonCancellable) {
+                    clearPendingVoiceImageQuestion(sourceTag)
+                    finishAiQuestionForegroundWork()
+                }
+                throw cancelled
             } catch (error: Exception) {
                 Log.e("AIHijack", "[$sourceTag] Eyevue AI photo failed", error)
                 withContext(Dispatchers.Main) {
@@ -4597,7 +4606,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     finishAiQuestionForegroundWork()
                     Toast.makeText(
                         this@MainActivity,
-                        "Eyevue did not return a photo. Please try again.",
+                        error.message ?: "Eyevue photo capture failed. Please try again.",
                         Toast.LENGTH_LONG,
                     ).show()
                 }
@@ -4811,6 +4820,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         imagePath: String,
         source: ImageQuestionSource,
         transferDurationMs: Long,
+        offerSpokenQuestion: Boolean = true,
     ) {
         val imageFile = File(imagePath)
         val metrics = readImageQuestionMetrics(imageFile)
@@ -4865,6 +4875,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     Log.i("ImageQuestion", "Awaiting parallel audio question recording...")
                     initialQuestion = parallelDeferred.await()
                 } else if (
+                    offerSpokenQuestion &&
                     ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
                 ) {
                     withContext(Dispatchers.Main) {
