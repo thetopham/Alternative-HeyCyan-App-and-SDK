@@ -49,6 +49,13 @@ class EyevueGattClient(
         private val ENABLE_NOTIFICATION_VALUE = byteArrayOf(0x01, 0x00)
     }
 
+    @Volatile
+    private var suppressProbeWakeEvents = false
+
+    fun setPhotoProbeWakeSuppression(enabled: Boolean) {
+        suppressProbeWakeEvents = enabled
+    }
+
     private val operationMutex = Mutex()
     private val decoder = EyevueFrameDecoder()
     private val _state = MutableStateFlow(EyevueGattState.DISCONNECTED)
@@ -200,7 +207,15 @@ class EyevueGattClient(
                         "EyevueRaw",
                         "AA14 len=${value.size} preview=${value.toHexPreview()}",
                     )
-                    decoder.append(value).forEach(_frames::tryEmit)
+                    decoder.append(value).forEach { frame ->
+                        if (suppressProbeWakeEvents && frame.commandId == EyevueProtocol.CMD_RECEIVE_VOICE_DATA_START) {
+                            // Fence at notification receipt, before async collectors can delay
+                            // handling until after the image-pull probe has completed.
+                            Log.d(TAG, "AA14 0x97 retained in raw trace; probe wake routing suppressed")
+                        } else {
+                            _frames.tryEmit(frame)
+                        }
+                    }
                 }
 
                 EyevueProtocol.PHOTO_NOTIFY_UUID -> {

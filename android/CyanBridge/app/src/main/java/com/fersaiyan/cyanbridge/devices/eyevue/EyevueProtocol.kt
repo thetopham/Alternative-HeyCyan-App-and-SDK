@@ -30,13 +30,15 @@ data class EyevueVoiceAssistantStatus(
  * Encapsulates the Eyevue smart glasses protocol based on reverse-engineered sources.
  *
  * Eyevue BLE datagram format:
- * [0xAB, 0x55, len_hi, len_lo, commandId, payload..., crc]
+ * [sof_hi, 0x55, len_hi, len_lo, commandId, payload..., crc]
+ * Commands use 0xAB; AA14 responses use 0xAC. Legacy 0xAB input remains accepted.
  * Where:
  * - len = payload.size + 2 (command plus CRC, 2 bytes big-endian)
  * - crc = (commandId + sum(payload)) & 0xFF
  */
 object EyevueProtocol {
     const val SOF_HI = 0xAB.toByte()
+    const val RESPONSE_SOF_HI = 0xAC.toByte()
     const val SOF_LO = 0x55.toByte()
 
     val SERVICE_UUID: UUID = UUID.fromString("0000aa12-0000-1000-8000-00805f9b34fb")
@@ -56,6 +58,7 @@ object EyevueProtocol {
     const val CMD_CONTROL_MUSIC = 49
     const val CMD_CONTROL_VOLUME = 50
     const val CMD_RECORD_AUDIO = 52
+    const val CMD_PULL_IMAGE = 54
     const val CMD_GET_WIFI_INFO = 57
     const val CMD_GET_CUSTOMER = 100
     const val CMD_APP_LIVE = 103
@@ -118,9 +121,12 @@ object EyevueProtocol {
         return packet
     }
 
+    internal fun isDatagramHeader(high: Byte, low: Byte): Boolean =
+        (high == SOF_HI || high == RESPONSE_SOF_HI) && low == SOF_LO
+
     fun parseDatagram(packet: ByteArray): EyevueFrame {
         require(packet.size >= 6) { "Eyevue packet is too short" }
-        require(packet[0] == SOF_HI && packet[1] == SOF_LO) { "Invalid Eyevue packet header" }
+        require(isDatagramHeader(packet[0], packet[1])) { "Invalid Eyevue packet header" }
         val declaredLength = u16(packet[2], packet[3])
         require(declaredLength >= 2) { "Invalid Eyevue packet length: $declaredLength" }
         require(packet.size == declaredLength + 4) {
@@ -166,6 +172,15 @@ object EyevueProtocol {
 
     fun buildPhotoPacket(highQuality: Boolean): ByteArray =
         valuePacket(CMD_TAKE_PHOTO, if (highQuality) PARAM_PHOTO_HIGH_QUALITY else PARAM_PHOTO_THUMBNAIL)
+
+    /**
+     * Vendor appPullImage(type): the single byte's index/quality meaning is unconfirmed.
+     * Keep it opaque for controlled probes; this does not imply a high-resolution mode.
+     */
+    fun buildPullImagePacket(type: Int): ByteArray {
+        require(type in 0..0xFF) { "Eyevue image pull type must fit in one byte" }
+        return valuePacket(CMD_PULL_IMAGE, type)
+    }
 
     fun buildStartVideoPacket(): ByteArray = valuePacket(CMD_RECORD_VIDEO, PARAM_RECORD_START)
 
@@ -341,7 +356,7 @@ class EyevueFrameDecoder {
 
         while (true) {
             while (cursor + 1 < bytes.size &&
-                (bytes[cursor] != EyevueProtocol.SOF_HI || bytes[cursor + 1] != EyevueProtocol.SOF_LO)
+                !EyevueProtocol.isDatagramHeader(bytes[cursor], bytes[cursor + 1])
             ) {
                 cursor++
             }

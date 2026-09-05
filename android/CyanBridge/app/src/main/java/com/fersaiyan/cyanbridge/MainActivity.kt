@@ -6999,6 +6999,60 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    /** Debug-only measurement harness. Saves locally; never starts assistant/audio/Wi-Fi. */
+    private fun runEyevueBleResolutionProbe(pullType: Int?) {
+        if (!BuildConfig.DEBUG) return
+        val manager = getOrCreateEyevueManager()
+        if (!manager.isConnected()) {
+            Log.w("EyevueBleProbe", "REJECTED reason=not_connected")
+            Toast.makeText(this, "Connect EyeVue before the BLE probe.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!eyevueAiPhotoInProgress.compareAndSet(false, true)) {
+            Log.w("EyevueBleProbe", "REJECTED reason=capture_busy")
+            return
+        }
+        val label = if (pullType == null) "shutter_31" else "pull_36_type_$pullType"
+        lifecycleScope.launch(Dispatchers.IO) {
+            val startedAt = android.os.SystemClock.elapsedRealtime()
+            Log.i("EyevueBleProbe", "START mode=$label")
+            try {
+                val bytes = if (pullType == null) {
+                    manager.probeCapturePhoto()
+                } else {
+                    manager.probePhotoPull(pullType)
+                } ?: throw IOException("No complete BLE image within 120 seconds")
+                val file = File(cacheDir, "EyevueProbe_${label}_${System.currentTimeMillis()}.jpg")
+                file.writeBytes(bytes)
+                val metrics = readImageQuestionMetrics(file)
+                    ?: throw IOException("BLE response is not a decodable JPEG")
+                val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
+                Log.i(
+                    "EyevueBleProbe",
+                    "SUCCESS mode=$label dimensions=${metrics.width}x${metrics.height} " +
+                        "bytes=${bytes.size} elapsedMs=$elapsed file=${file.name}",
+                )
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "BLE $label: ${metrics.width}x${metrics.height}, ${bytes.size} bytes",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            } catch (cancelled: CancellationException) {
+                Log.i("EyevueBleProbe", "CANCELLED mode=$label")
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w("EyevueBleProbe", "FAILED mode=$label reason=${error.message}", error)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "BLE probe: ${error.message}", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                eyevueAiPhotoInProgress.set(false)
+            }
+        }
+    }
+
     private fun handleTaskerCommand(startIntent: Intent?) {
         if (startIntent == null) return
 
@@ -7010,6 +7064,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
 
         val normalizedCommand = command?.lowercase() ?: return
+        if (normalizedCommand in setOf("eyevue_ble_probe_capture", "eyevue_ble_probe_pull_0", "eyevue_ble_probe_pull_1")) {
+            // Consume even rejected probes, so Activity recreation cannot replay one.
+            startIntent.removeExtra(EXTRA_TASKER_COMMAND)
+        }
         val activeSession = GlassesSessionCoordinator.currentSession()
         if (activeSession != null) {
             Log.w(
@@ -7025,6 +7083,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
 
         when (normalizedCommand) {
+            "eyevue_ble_probe_capture", "eyevue_ble_probe_pull_0", "eyevue_ble_probe_pull_1" -> {
+                if (BuildConfig.DEBUG) {
+                    runEyevueBleResolutionProbe(
+                        when (normalizedCommand) {
+                            "eyevue_ble_probe_pull_0" -> 0
+                            "eyevue_ble_probe_pull_1" -> 1
+                            else -> null
+                        },
+                    )
+                }
+            }
             "scan" -> binding.btnScan.performClick()
             "connect" -> binding.btnConnect.performClick()
             "disconnect" -> binding.btnDisconnect.performClick()

@@ -70,6 +70,126 @@ class EyevueProtocolTest {
     }
 
     @Test
+    fun parsesIncomingAcBatteryCustomerAndStatusFixtures() {
+        val battery = EyevueProtocol.parseBattery(EyevueProtocol.parseDatagram(incomingBatteryPacket()))
+        assertEquals(EyevueBattery(percent = 86, isCharging = false), battery)
+
+        val customer = EyevueProtocol.parseCustomer(EyevueProtocol.parseDatagram(incomingCustomerPacket()))
+        assertEquals(EyevueCustomer(project = "TK8", customer = "G6"), customer)
+
+        val status = EyevueProtocol.parseVoiceAssistantStatus(
+            EyevueProtocol.parseDatagram(incomingStatusPacket()),
+        )
+        assertEquals(
+            EyevueVoiceAssistantStatus(localOfflineSpeechEnabled = false, aiWakeWordEnabled = true),
+            status,
+        )
+    }
+
+    @Test
+    fun decoderHandlesEveryIncomingFrameSplitIncludingHeader() {
+        for (packet in listOf(incomingBatteryPacket(), incomingCustomerPacket(), incomingStatusPacket())) {
+            for (split in 1 until packet.size) {
+                val decoder = EyevueFrameDecoder()
+                assertTrue(decoder.append(packet.copyOfRange(0, split)).isEmpty())
+                val actual = decoder.append(packet.copyOfRange(split, packet.size)).single()
+                val expected = EyevueProtocol.parseDatagram(packet)
+                assertEquals(expected.commandId, actual.commandId)
+                assertArrayEquals(expected.payload, actual.payload)
+            }
+        }
+    }
+
+    @Test
+    fun decoderHandlesIncomingAndLegacyFramesMixedWithNoise() {
+        val decoder = EyevueFrameDecoder()
+        val stream = byteArrayOf(0, 0x55, 0xAB.toByte(), 0x12, 0xAC.toByte()) +
+            incomingBatteryPacket() + byteArrayOf(0xAD.toByte(), 0x55, 0, 0) +
+            EyevueProtocol.buildStartLiveP2pPacket() + incomingStatusPacket()
+        val frames = mutableListOf<EyevueFrame>()
+        // Single-byte notifications also exercise retaining a trailing partial header.
+        for (byte in stream) frames += decoder.append(byteArrayOf(byte))
+        assertEquals(listOf(0x17, 0x67, 0x71), frames.map { it.commandId })
+        assertArrayEquals(byteArrayOf(0x38, 0x36, 0), frames[0].payload)
+        assertArrayEquals(byteArrayOf(0x31), frames[1].payload)
+        assertArrayEquals(byteArrayOf(1), frames[2].payload)
+    }
+
+    @Test
+    fun parserRejectsIncomingCrcLengthAndHeaderErrors() {
+        val valid = incomingBatteryPacket()
+        val invalidPackets = listOf(
+            valid.copyOf().also { it[it.lastIndex] = 0 },
+            valid.copyOf().also { it[3] = 4 },
+            valid.copyOf().also { it[3] = 1 },
+            valid.copyOf(valid.size - 1),
+            valid + byteArrayOf(0),
+            valid.copyOf().also { it[0] = 0xAD.toByte() },
+            valid.copyOf().also { it[1] = 0x54 },
+        )
+        for (packet in invalidPackets) {
+            assertTrue(runCatching { EyevueProtocol.parseDatagram(packet) }.isFailure)
+        }
+    }
+
+    @Test
+    fun decoderRejectsIncomingCorruptFrameAndContinuesAtNextFrame() {
+        val decoder = EyevueFrameDecoder()
+        val corrupt = incomingBatteryPacket().also { it[it.lastIndex] = 0 }
+        val frames = decoder.append(corrupt + incomingCustomerPacket())
+        assertEquals(1, frames.size)
+        assertEquals(EyevueCustomer("TK8", "G6"), EyevueProtocol.parseCustomer(frames.single()))
+    }
+
+    @Test
+    fun decoderRejectsInvalidIncomingLengthAndResynchronizes() {
+        val decoder = EyevueFrameDecoder()
+        val invalidLength = byteArrayOf(0xAC.toByte(), 0x55, 0, 1, 0)
+        val frames = decoder.append(invalidLength + incomingStatusPacket())
+        assertEquals(1, frames.size)
+        assertEquals(0x71, frames.single().commandId)
+        assertArrayEquals(byteArrayOf(1), frames.single().payload)
+    }
+
+    @Test
+    fun decoderResetDropsPartialIncomingFrame() {
+        val decoder = EyevueFrameDecoder()
+        val packet = incomingBatteryPacket()
+        assertTrue(decoder.append(packet.copyOfRange(0, 4)).isEmpty())
+        decoder.reset()
+        val frames = decoder.append(incomingStatusPacket())
+        assertEquals(listOf(0x71), frames.map { it.commandId })
+    }
+
+    @Test
+    fun pullImagePacketPreservesOpaqueByteAndOutgoingHeader() {
+        for ((type, checksum) in listOf(0 to 0x36, 1 to 0x37, 255 to 0x35)) {
+            assertArrayEquals(
+                byteArrayOf(0xAB.toByte(), 0x55, 0, 3, 0x36, type.toByte(), checksum.toByte()),
+                EyevueProtocol.buildPullImagePacket(type),
+            )
+        }
+    }
+
+    @Test
+    fun pullImagePacketRejectsValuesThatWouldOtherwiseWrap() {
+        for (type in listOf(-1, 256, Int.MIN_VALUE, Int.MAX_VALUE)) {
+            assertTrue(runCatching { EyevueProtocol.buildPullImagePacket(type) }.isFailure)
+        }
+    }
+
+    // Explicit wire fixtures keep incoming magic, lengths and checksums independent
+    // from buildDatagram(), which must continue to produce outgoing AB55 frames.
+    private fun incomingBatteryPacket(): ByteArray =
+        byteArrayOf(0xAC.toByte(), 0x55, 0, 5, 0x17, 0x38, 0x36, 0, 0x85.toByte())
+
+    private fun incomingCustomerPacket(): ByteArray =
+        byteArrayOf(0xAC.toByte(), 0x55, 0, 10, 0x64, 0x54, 0x4B, 0x38, 0, 0x47, 0x36, 0, 0, 0xB8.toByte())
+
+    private fun incomingStatusPacket(): ByteArray =
+        byteArrayOf(0xAC.toByte(), 0x55, 0, 3, 0x71, 1, 0x72)
+
+    @Test
     fun photoAssemblerUsesDeclaredOffsetsInsteadOfArrivalOrder() {
         val assembler = EyevuePhotoAssembler()
         assembler.append(photoPacket(EyevueProtocol.CMD_RECEIVE_PHOTO_DATA_START))

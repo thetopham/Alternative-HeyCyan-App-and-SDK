@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 
@@ -59,6 +60,10 @@ class EyevueManager private constructor(context: Context) {
     private val _state = MutableStateFlow(EyevueState())
     private val _wakeWordEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     private var connectJob: Job? = null
+    private val photoCaptureMutex = Mutex()
+
+    @Volatile
+    private var photoPullProbeActive = false
 
     val state: StateFlow<EyevueState> = _state.asStateFlow()
     val wakeWordEvents: SharedFlow<Unit> = _wakeWordEvents.asSharedFlow()
@@ -136,18 +141,62 @@ class EyevueManager private constructor(context: Context) {
         "take photo",
     )
 
-    suspend fun capturePhotoForAi(timeoutMs: Long = 12_000L): ByteArray? = coroutineScope {
-        // Subscribe before issuing the command, and surface rejected transfers and
-        // write failures immediately instead of turning every failure into a timeout.
-        val photo = async(start = CoroutineStart.UNDISPATCHED) { client.photoResults.first() }
+    suspend fun capturePhotoForAi(timeoutMs: Long = 12_000L): ByteArray? = awaitPhoto(
+        packet = EyevueProtocol.buildPhotoPacket(highQuality = true),
+        timeoutMs = timeoutMs,
+        operation = "take photo",
+    )
+
+    /** Baseline shutter measurement with the same wake isolation as image-pull probes. */
+    suspend fun probeCapturePhoto(timeoutMs: Long = 120_000L): ByteArray? {
+        require(timeoutMs in 1L..120_000L) { "Eyevue probe timeout must be between 1 and 120000 ms" }
+        return awaitPhoto(
+            packet = EyevueProtocol.buildPhotoPacket(highQuality = true),
+            timeoutMs = timeoutMs,
+            operation = "photo probe shutter=0x31",
+            suppressWakeWord = true,
+        )
+    }
+
+    /** One bounded vendor image-pull request; does not change camera or audio settings. */
+    suspend fun probePhotoPull(type: Int, timeoutMs: Long = 120_000L): ByteArray? {
+        require(timeoutMs in 1L..120_000L) { "Eyevue photo-pull timeout must be between 1 and 120000 ms" }
+        return awaitPhoto(
+            packet = EyevueProtocol.buildPullImagePacket(type),
+            timeoutMs = timeoutMs,
+            operation = "photo-pull probe type=$type",
+            suppressWakeWord = true,
+        )
+    }
+
+    private suspend fun awaitPhoto(
+        packet: ByteArray,
+        timeoutMs: Long,
+        operation: String,
+        suppressWakeWord: Boolean = false,
+    ): ByteArray? = coroutineScope {
+        if (!photoCaptureMutex.tryLock()) {
+            throw IOException("An Eyevue photo capture or pull probe is already active")
+        }
         try {
-            withTimeoutOrNull(timeoutMs) {
-                client.write(EyevueProtocol.buildPhotoPacket(highQuality = true)).getOrThrow()
-                Log.d(TAG, "Eyevue command sent: take photo")
-                photo.await().getOrThrow()
+            photoPullProbeActive = suppressWakeWord
+            client.setPhotoProbeWakeSuppression(suppressWakeWord)
+            // Arm the result listener before writing so even an immediate notification
+            // is received. Failed writes and rejected transfers propagate to the caller.
+            val photo = async(start = CoroutineStart.UNDISPATCHED) { client.photoResults.first() }
+            try {
+                withTimeoutOrNull(timeoutMs) {
+                    client.write(packet).getOrThrow()
+                    Log.d(TAG, "Eyevue command sent: $operation")
+                    photo.await().getOrThrow()
+                }
+            } finally {
+                photo.cancel()
             }
         } finally {
-            photo.cancel()
+            client.setPhotoProbeWakeSuppression(false)
+            photoPullProbeActive = false
+            photoCaptureMutex.unlock()
         }
     }
 
@@ -284,21 +333,18 @@ class EyevueManager private constructor(context: Context) {
                 aiWakeWordEnabled = status.aiWakeWordEnabled,
                 localOfflineSpeechEnabled = status.localOfflineSpeechEnabled,
             )
-            if (!status.aiWakeWordEnabled) {
-                send(
-                    EyevueProtocol.buildSetVoiceAssistantStatusPacket(
-                        localOfflineSpeechEnabled = status.localOfflineSpeechEnabled,
-                        aiWakeWordEnabled = true,
-                    ),
-                    "enable AI wake word",
-                )
-            }
+            // A status reply reports the user's setting; it must not enable voice
+            // recognition as a side effect of connecting or measuring a photo.
         }
 
         when (frame.commandId) {
             EyevueProtocol.CMD_RECEIVE_VOICE_DATA_START -> {
-                Log.i(TAG, "Eyevue AI wake word started a voice stream")
-                _wakeWordEvents.tryEmit(Unit)
+                if (photoPullProbeActive) {
+                    Log.d(TAG, "Eyevue 0x97 received during photo-pull probe; wake event suppressed")
+                } else {
+                    Log.i(TAG, "Eyevue AI wake word started a voice stream")
+                    _wakeWordEvents.tryEmit(Unit)
+                }
             }
 
             EyevueProtocol.CMD_GET_CAPACITY,
